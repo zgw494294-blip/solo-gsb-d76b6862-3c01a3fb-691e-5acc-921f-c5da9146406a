@@ -21,6 +21,16 @@ let solveTimer = null;
 let lastErrorKey = "";
 let inflightToken = 0;
 
+/* 不透明度反推：沿用最近一次求解结果，顺序与待调图层由用户在结果栏确认 */
+const infer = {
+  order: [],          // 底 → 顶的图层 ID 序列（初始同步自求解结果）
+  tuneIds: [],        // 待调图层 ID（至多 2 个）
+  result: null,       // 最近一次反推结果
+  fingerprint: "",    // 结果对应的输入指纹，输入变动即作废
+  busy: false,
+  error: null,        // 反推卡片自身的错误（{errors:[...]} 或字符串）
+};
+
 const $ = (sel) => document.querySelector(sel);
 const elLayers = $("#layers");
 const elSamples = $("#samples");
@@ -29,6 +39,7 @@ const elErrorBanner = $("#errorBanner");
 const elErrorList = $("#errorList");
 const elResultBody = $("#resultBody");
 const elStatus = $("#status");
+const elInferBody = $("#inferBody");
 
 // ------------------------------------------------------------ 工具函数 --
 
@@ -51,7 +62,18 @@ function escapeHtml(s) {
 
 function scheduleSolve(delay = 200) {
   clearTimeout(solveTimer);
+  invalidateInfer();
   solveTimer = setTimeout(runSolve, delay);
+}
+
+// 图层/样本/关系一旦变动，反推结果立即作废；已确认的顺序与勾选保留
+// （顺序仅在图层集合变化时由 syncInferWithSolve 重置）
+function invalidateInfer() {
+  if (infer.result || infer.error) {
+    infer.result = null;
+    infer.error = null;
+    if (elInferBody) renderInfer();
+  }
 }
 
 // ------------------------------------------------------------ 渲染输入 --
@@ -339,18 +361,7 @@ function uniqueId(prefix) {
 // ------------------------------------------------------------ 调用后端 --
 
 async function runSolve() {
-  const payload = {
-    layers: state.layers.map((l) => ({
-      id: l.id,
-      color: l.color,
-      opacity: l.opacity,
-    })),
-    samples: state.samples.map((s) => ({
-      background: s.background,
-      target: s.target,
-    })),
-    relations: state.relations.map((r) => ({ lower: r.lower, upper: r.upper })),
-  };
+  const payload = buildPayload();
 
   const token = ++inflightToken;
   elStatus.textContent = "计算中…";
@@ -369,6 +380,7 @@ async function runSolve() {
     } else {
       showErrors([]);
       renderResult(data);
+      syncInferWithSolve();
     }
   } catch (err) {
     if (token !== inflightToken) return;
@@ -501,6 +513,275 @@ function fmtSse(v) {
   return Number(v.toFixed(4)).toString();
 }
 
+// ------------------------------------------------------------ 不透明度反推 --
+
+function buildPayload() {
+  return {
+    layers: state.layers.map((l) => ({
+      id: l.id,
+      color: l.color,
+      opacity: l.opacity,
+    })),
+    samples: state.samples.map((s) => ({
+      background: s.background,
+      target: s.target,
+    })),
+    relations: state.relations.map((r) => ({ lower: r.lower, upper: r.upper })),
+  };
+}
+
+// 求解成功后同步：图层集合变化时重置已确认顺序并清理失效勾选
+function syncInferWithSolve() {
+  const ids = state.layers.map((l) => l.id);
+  const curKey = [...ids].sort().join("\u0001");
+  const orderKey = [...infer.order].sort().join("\u0001");
+  if (orderKey !== curKey) {
+    infer.order = [...ids];
+    infer.tuneIds = infer.tuneIds.filter((id) => ids.includes(id));
+    infer.result = null;
+    infer.error = null;
+    renderInfer();
+  }
+}
+
+function renderInfer() {
+  if (infer.order.length === 0) {
+    elInferBody.innerHTML = `<div class="result-empty">先完成一次叠序校准…</div>`;
+    return;
+  }
+
+  const layersById = new Map(state.layers.map((l) => [l.id, l]));
+  const rows = infer.order
+    .map((id, k) => {
+      const layer = layersById.get(id);
+      const color = layer && normalizeHex(layer.color) ? normalizeHex(layer.color) : "#000000";
+      const alpha = layer && typeof layer.opacity === "number" ? layer.opacity : null;
+      const checked = infer.tuneIds.includes(id);
+      const disabled = !checked && infer.tuneIds.length >= 2;
+      return `
+        <div class="infer-row${checked ? " is-tune" : ""}">
+          <span class="row-index">${k + 1}</span>
+          <label class="tune-check" title="勾选为待调图层（至多 2 个）">
+            <input type="checkbox" data-act="infer-toggle" data-id="${escapeHtml(id)}"
+                   ${checked ? "checked" : ""} ${disabled ? "disabled" : ""} />
+            待调
+          </label>
+          <span class="dot-sm" style="background:${hexToRgba(color, alpha ?? 1)}"></span>
+          <span class="cid-sm">${escapeHtml(id)}</span>
+          <span class="cop-sm">${alpha === null ? "α=—" : "α=" + Number(alpha.toFixed(2))}</span>
+          <span class="spacer"></span>
+          <button class="btn btn-ghost btn-small" data-act="infer-up" data-i="${k}"
+                  type="button" ${k === 0 ? "disabled" : ""} title="上移（更靠近顶）">▲</button>
+          <button class="btn btn-ghost btn-small" data-act="infer-down" data-i="${k}"
+                  type="button" ${k === infer.order.length - 1 ? "disabled" : ""}
+                  title="下移（更靠近底）">▼</button>
+        </div>`;
+    })
+    .join("");
+
+  const canRun = infer.tuneIds.length >= 1 && infer.tuneIds.length <= 2;
+  const errorHtml = infer.error
+    ? `<div class="infer-error"><div class="error-title">无法反推：</div><ul>
+         ${(infer.error.errors || [{ message: infer.error.message || "反推失败" }])
+           .map((er) => `<li>${escapeHtml(er.message)}</li>`)
+           .join("")}
+       </ul></div>`
+    : "";
+
+  elInferBody.innerHTML = `
+    <div class="order-title">确认底 → 顶顺序（▲ 上移到更靠顶；勾选 1～2 个待调图层，其余保留原不透明度）</div>
+    <div class="infer-rows">
+      <div class="infer-end">底</div>
+      ${rows}
+      <div class="infer-end">↑ 顶</div>
+    </div>
+    <div class="infer-actions">
+      <button id="inferRunBtn" class="btn btn-small" type="button" ${canRun ? "" : "disabled"}>
+        ${infer.busy ? "反推计算中…" : "开始反推不透明度"}
+      </button>
+      <span class="hint">
+        ${canRun
+          ? `待调：${infer.tuneIds.map(escapeHtml).join("、")}，网格 0.00～1.00 步长 0.01（含原始参数组）`
+          : "请勾选 1～2 个待调图层"}
+      </span>
+    </div>
+    ${errorHtml}
+    <div id="inferResult"></div>
+  `;
+
+  const btn = $("#inferRunBtn");
+  if (btn) btn.addEventListener("click", runInfer);
+  renderInferResult();
+}
+
+function renderInferResult() {
+  const box = $("#inferResult");
+  if (!box) return;
+  const r = infer.result;
+  if (!r) {
+    box.innerHTML = "";
+    return;
+  }
+
+  const layersById = new Map(state.layers.map((l) => [l.id, l]));
+  const tuneRows = r.tune
+    .map((t) => {
+      const layer = layersById.get(t.id);
+      const color = layer && normalizeHex(layer.color) ? normalizeHex(layer.color) : "#000000";
+      const delta = t.suggestedOpacity - t.originalOpacity;
+      const deltaTxt =
+        delta === 0 ? "不变" : (delta > 0 ? "＋" : "−") + Math.abs(delta).toFixed(2);
+      return `
+        <tr>
+          <td><span class="dot-xs" style="background:${hexToRgba(color, 1)}"></span>${escapeHtml(t.id)}</td>
+          <td>${Number(t.originalOpacity.toFixed(2))}</td>
+          <td class="sug-cell">${Number(t.suggestedOpacity.toFixed(2))}</td>
+          <td class="${delta > 0 ? "r-up" : delta < 0 ? "r-down" : ""}">${deltaTxt}</td>
+        </tr>`;
+    })
+    .join("");
+
+  const improved = r.afterTotalSse < r.beforeTotalSse;
+  box.innerHTML = `
+    <div class="infer-result">
+      <div class="metric-row">
+        <span>调整前总误差：<b>${fmtSse(r.beforeTotalSse)}</b></span>
+        <span>调整后总误差：<b class="${improved ? "r-good" : ""}">${fmtSse(r.afterTotalSse)}</b></span>
+        <span>评估组合：<b>${r.combinationsChecked}</b> 组</span>
+        <span>同分时按 ID 字典序参数元组决胜</span>
+      </div>
+      <table class="tune-table">
+        <thead><tr><th>待调图层</th><th>原值</th><th>建议值</th><th>变化</th></tr></thead>
+        <tbody>${tuneRows}</tbody>
+      </table>
+      <div class="infer-apply-row">
+        <button id="inferApplyBtn" class="btn btn-small" type="button">应用建议值到图层并重新求解</button>
+      </div>
+      ${r.samples.map(renderInferSample).join("")}
+    </div>
+  `;
+  $("#inferApplyBtn").addEventListener("click", applySuggestions);
+}
+
+function renderInferSample(s) {
+  const rgbTxt = (p) => p.predictedRgb.map((v) => Math.round(v)).join(", ");
+  return `
+    <div class="sample-result infer-sample">
+      <div class="sample-result-head">
+        <span>样本 ${s.index + 1}</span>
+        <span>SSE：${fmtSse(s.before.sse)} → <b class="${s.after.sse < s.before.sse ? "r-good" : ""}">${fmtSse(s.after.sse)}</b></span>
+      </div>
+      <div class="infer-compare">
+        <div class="swatch-box">
+          <span class="swatch-big" style="background:${s.target}"></span>
+          <span class="swatch-meta">
+            <div class="name">目标色</div>
+            <div class="hexval">${s.target}</div>
+          </span>
+        </div>
+        <div class="compare-arrow">→</div>
+        <div class="swatch-box">
+          <span class="swatch-big" style="background:${s.before.predictedHex}"></span>
+          <span class="swatch-meta">
+            <div class="name">调整前预测</div>
+            <div class="hexval">${s.before.predictedHex}</div>
+            <div class="name">rgb(${rgbTxt(s.before)})</div>
+          </span>
+        </div>
+        <div class="compare-arrow">→</div>
+        <div class="swatch-box">
+          <span class="swatch-big sug-swatch" style="background:${s.after.predictedHex}"></span>
+          <span class="swatch-meta">
+            <div class="name">调整后预测</div>
+            <div class="hexval">${s.after.predictedHex}</div>
+            <div class="name">rgb(${rgbTxt(s.after)})</div>
+          </span>
+        </div>
+      </div>
+      <div class="bg-note">
+        <span class="mini" style="background:${s.background}"></span>
+        在背景 ${s.background} 上叠放
+      </div>
+    </div>
+  `;
+}
+
+async function runInfer() {
+  const payload = {
+    ...buildPayload(),
+    order: infer.order,
+    tuneIds: infer.tuneIds,
+  };
+  infer.busy = true;
+  infer.error = null;
+  renderInfer();
+  try {
+    const resp = await fetch("/api/infer-opacity", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      infer.error = { errors: data.errors || [{ message: "反推失败" }] };
+    } else {
+      infer.result = data;
+      infer.fingerprint = JSON.stringify(buildPayload());
+      infer.error = null;
+    }
+  } catch (err) {
+    infer.error = { message: "无法连接计算服务：" + err.message };
+  } finally {
+    infer.busy = false;
+    renderInfer();
+  }
+}
+
+function applySuggestions() {
+  const r = infer.result;
+  if (!r) return;
+  for (const t of r.tune) {
+    const layer = state.layers.find((l) => l.id === t.id);
+    if (layer) layer.opacity = Number(t.suggestedOpacity.toFixed(2));
+  }
+  infer.result = null;
+  infer.error = null;
+  render();
+  scheduleSolve(0);
+  renderInfer();
+}
+
+document.addEventListener("click", (e) => {
+  const t = e.target.closest("[data-act^='infer-']");
+  if (!t) return;
+  const act = t.dataset.act;
+  const i = Number(t.dataset.i);
+
+  if (act === "infer-up" && i > 0) {
+    [infer.order[i - 1], infer.order[i]] = [infer.order[i], infer.order[i - 1]];
+    infer.result = null;
+    renderInfer();
+  } else if (act === "infer-down" && i < infer.order.length - 1) {
+    [infer.order[i + 1], infer.order[i]] = [infer.order[i], infer.order[i + 1]];
+    infer.result = null;
+    renderInfer();
+  }
+});
+
+document.addEventListener("change", (e) => {
+  const t = e.target;
+  if (t.dataset.act !== "infer-toggle") return;
+  const id = t.dataset.id;
+  if (t.checked) {
+    if (!infer.tuneIds.includes(id) && infer.tuneIds.length < 2) infer.tuneIds.push(id);
+  } else {
+    infer.tuneIds = infer.tuneIds.filter((x) => x !== id);
+  }
+  infer.result = null;
+  renderInfer();
+});
+
 // ------------------------------------------------------------ 启动 --
 render();
+renderInfer();
 runSolve();

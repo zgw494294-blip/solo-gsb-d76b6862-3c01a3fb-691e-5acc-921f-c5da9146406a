@@ -4,6 +4,7 @@
 - 线性光空间内逐层 alpha 合成（Porter-Duff "over"）
 - 枚举全部底到顶排列，按未取整 RGB 通道平方误差总和选优
 - 同分时按 ID 序列字典序决胜
+- 顺序确定后，联合扫描 1～2 个图层的不透明度反推建议值
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ MIN_LAYERS = 2
 MAX_SAMPLES = 4
 MIN_SAMPLES = 1
 MAX_RELATIONS = 12
+MAX_TUNE_LAYERS = 2
+OPACITY_STEPS = 101  # 0.00 ~ 1.00，步长 0.01
 
 
 class CalibrationError(Exception):
@@ -144,10 +147,40 @@ def _find_cycle(adj: list[list[int]]) -> list[int] | None:
     return None
 
 
-# ------------------------------------------------------------------- 求解 --
+# ------------------------------------------------------------- 输入解析 --
 
 
-def solve(payload: Any) -> dict[str, Any]:
+class _Inputs:
+    """图层 / 样本 / 关系解析与成环检测后的共享数据。"""
+
+    __slots__ = (
+        "n",
+        "layer_ids",
+        "layer_hex",
+        "layer_lin",
+        "layer_alpha",
+        "samples_bg_hex",
+        "samples_bg_srgb",
+        "samples_tg_hex",
+        "samples_tg_srgb",
+        "pairs",
+    )
+
+    def __init__(self) -> None:
+        self.n = 0
+        self.layer_ids: list[str] = []
+        self.layer_hex: list[str] = []
+        self.layer_lin: list[tuple[float, float, float]] = []
+        self.layer_alpha: list[float] = []
+        self.samples_bg_hex: list[str] = []
+        self.samples_bg_srgb: list[tuple[float, float, float]] = []
+        self.samples_tg_hex: list[str] = []
+        self.samples_tg_srgb: list[tuple[float, float, float]] = []
+        self.pairs: list[tuple[int, int]] = []
+
+
+def _parse_inputs(payload: Any) -> _Inputs:
+    """解析图层、样本、先后关系并做成环检测；任一非法即抛 CalibrationError。"""
     if not isinstance(payload, dict):
         raise CalibrationError([_err("form", "请求体必须是 JSON 对象")])
 
@@ -283,12 +316,64 @@ def solve(payload: Any) -> dict[str, Any]:
             [_err("relations", f"图层先后关系成环，存在冲突：{chain}（底 → 顶方向不能绕回自身）")]
         )
 
+    data = _Inputs()
+    data.n = n
+    data.layer_ids = layer_ids
+    data.layer_hex = layer_hex
+    data.layer_lin = layer_lin
+    data.layer_alpha = layer_alpha
+    data.samples_bg_hex = samples_bg_hex
+    data.samples_bg_srgb = samples_bg_srgb
+    data.samples_tg_hex = samples_tg_hex
+    data.samples_tg_srgb = samples_tg_srgb
+    data.pairs = pairs
+    return data
+
+
+# ------------------------------------------------------------- 误差评估 --
+
+
+def _evaluate(
+    data: _Inputs,
+    order_idx: list[int],
+    alphas: list[float],
+) -> tuple[float, list[dict[str, Any]]]:
+    """按未取整 RGB × 255 平方误差口径评估给定顺序/不透明度，返回 (总SSE, 各样本明细)。"""
+    total_sse = 0.0
+    details: list[dict[str, Any]] = []
+    for s in range(len(data.samples_bg_srgb)):
+        pred = render_stack(data.samples_bg_srgb[s], order_idx, data.layer_lin, alphas)
+        pred255 = [_clamp01(pred[c]) * 255.0 for c in range(3)]
+        tgt255 = [data.samples_tg_srgb[s][c] * 255.0 for c in range(3)]
+        channel_sse = [(pred255[c] - tgt255[c]) ** 2 for c in range(3)]
+        sse = sum(channel_sse)
+        total_sse += sse
+        rounded = [max(0, min(255, int(round(v)))) for v in pred255]
+        details.append(
+            {
+                "predictedRgb": pred255,
+                "predictedHex": "#{:02x}{:02x}{:02x}".format(*rounded),
+                "targetRgb": tgt255,
+                "channelSse": channel_sse,
+                "sse": sse,
+            }
+        )
+    return total_sse, details
+
+
+# ------------------------------------------------------------------- 求解 --
+
+
+def solve(payload: Any) -> dict[str, Any]:
+    data = _parse_inputs(payload)
+    n = data.n
+
     # ---- 枚举排列并选优 ---------------------------------------------------
     def feasible(perm: tuple[int, ...]) -> bool:
         pos = [0] * n
         for p, idx in enumerate(perm):
             pos[idx] = p
-        return all(pos[li] < pos[ui] for li, ui in pairs)
+        return all(pos[li] < pos[ui] for li, ui in data.pairs)
 
     best_sse = math.inf
     best_key: tuple[float, tuple[str, ...]] | None = None
@@ -301,18 +386,18 @@ def solve(payload: Any) -> dict[str, Any]:
             continue
         feasible_count += 1
         total_sse = 0.0
-        for s in range(len(samples_bg_hex)):
-            pred = render_stack(samples_bg_srgb[s], list(perm), layer_lin, layer_alpha)
+        for s in range(len(data.samples_bg_hex)):
+            pred = render_stack(data.samples_bg_srgb[s], list(perm), data.layer_lin, data.layer_alpha)
             for c in range(3):
-                diff = pred[c] * 255.0 - samples_tg_srgb[s][c] * 255.0
+                diff = pred[c] * 255.0 - data.samples_tg_srgb[s][c] * 255.0
                 total_sse += diff * diff
-        id_seq = tuple(layer_ids[idx] for idx in perm)
+        id_seq = tuple(data.layer_ids[idx] for idx in perm)
         if best_key is None or (total_sse, id_seq) < best_key:
             best_sse = total_sse
             best_key = (total_sse, id_seq)
             best_perm = perm
 
-    # 有环已在上面拦截；这里仅作防御
+    # 有环已在解析时拦截；这里仅作防御
     if best_perm is None:  # pragma: no cover
         raise CalibrationError([_err("relations", "约束过强，没有任何可行的图层顺序")])
 
@@ -321,35 +406,182 @@ def solve(payload: Any) -> dict[str, Any]:
 
     # ---- 组装各样本明细 ---------------------------------------------------
     sample_results: list[dict[str, Any]] = []
-    for s in range(len(samples_bg_hex)):
-        pred = render_stack(samples_bg_srgb[s], list(best_perm), layer_lin, layer_alpha)
-        pred255 = [_clamp01(pred[c]) * 255.0 for c in range(3)]
-        tgt255 = [samples_tg_srgb[s][c] * 255.0 for c in range(3)]
-        channel_sse = [(pred255[c] - tgt255[c]) ** 2 for c in range(3)]
-        sse = sum(channel_sse)
-        rounded = [max(0, min(255, int(round(v)))) for v in pred255]
+    for s, detail in enumerate(_evaluate(data, list(best_perm), data.layer_alpha)[1]):
         sample_results.append(
             {
                 "index": s,
-                "background": samples_bg_hex[s],
-                "target": samples_tg_hex[s],
-                "predictedRgb": pred255,
-                "predictedHex": "#{:02x}{:02x}{:02x}".format(*rounded),
-                "targetRgb": tgt255,
-                "channelSse": channel_sse,
-                "sse": sse,
+                "background": data.samples_bg_hex[s],
+                "target": data.samples_tg_hex[s],
+                **detail,
             }
         )
 
     return {
-        "order": [layer_ids[idx] for idx in best_perm],
+        "order": [data.layer_ids[idx] for idx in best_perm],
         "orderIndexes": list(best_perm),
         "layers": [
-            {"id": layer_ids[i], "color": layer_hex[i], "opacity": layer_alpha[i]}
+            {"id": data.layer_ids[i], "color": data.layer_hex[i], "opacity": data.layer_alpha[i]}
             for i in best_perm
         ],
         "totalSse": total_sse,
         "permutationsChecked": total_count,
         "feasibleCount": feasible_count,
+        "samples": sample_results,
+    }
+
+
+# ------------------------------------------------------- 不透明度反推 --
+
+
+def _parse_order(payload: Any, data: _Inputs) -> tuple[list[str] | None, list[dict[str, Any]]]:
+    """校验底到顶顺序：必须是恰好包含全部图层 ID 各一次、且满足先后关系的数组。"""
+    errors: list[dict[str, Any]] = []
+    raw_order = payload.get("order")
+    if not isinstance(raw_order, list):
+        errors.append(
+            _err("order", "缺少 order 字段或其格式不正确：需按底 → 顶顺序给出全部图层 ID 的数组")
+        )
+        return None, errors
+
+    n = data.n
+    if len(raw_order) != n:
+        errors.append(
+            _err("order", f"底 → 顶顺序必须恰好包含全部 {n} 个图层 ID，当前给出 {len(raw_order)} 个")
+        )
+
+    id_to_index = {lid: i for i, lid in enumerate(data.layer_ids)}
+    order_ids: list[str] = []
+    seen: set[str] = set()
+    for k, item in enumerate(raw_order):
+        if not isinstance(item, str) or not item.strip():
+            errors.append(_err("order", f"顺序第 {k + 1} 项不是有效的图层 ID"))
+            continue
+        lid = item.strip()
+        if lid not in id_to_index:
+            errors.append(_err("order", f"顺序中的图层 ID 不存在：{lid}"))
+            continue
+        if lid in seen:
+            errors.append(_err("order", f"顺序中图层 ID 重复：{lid}（每个图层须恰好出现一次）"))
+            continue
+        seen.add(lid)
+        order_ids.append(lid)
+
+    if errors or len(order_ids) != n:
+        return None, errors
+
+    pos = {lid: p for p, lid in enumerate(order_ids)}
+    for li, ui in data.pairs:
+        lower, upper = data.layer_ids[li], data.layer_ids[ui]
+        if pos[lower] > pos[upper]:
+            errors.append(
+                _err("order", f"顺序不满足先后关系：{lower} 必须在 {upper} 的更下方（底 → 顶方向）")
+            )
+    if errors:
+        return None, errors
+    return order_ids, errors
+
+
+def _parse_tune_ids(payload: Any, data: _Inputs) -> tuple[list[str] | None, list[dict[str, Any]]]:
+    """校验待调图层 ID：1～2 个、不可重复、必须存在。"""
+    errors: list[dict[str, Any]] = []
+    raw_tune = payload.get("tuneIds")
+    if not isinstance(raw_tune, list):
+        errors.append(
+            _err("tune", "缺少 tuneIds 字段或其格式不正确：需给出 1～2 个待反推不透明度的图层 ID 数组")
+        )
+        return None, errors
+
+    if not (1 <= len(raw_tune) <= MAX_TUNE_LAYERS):
+        errors.append(
+            _err("tune", f"待调图层必须为 1～{MAX_TUNE_LAYERS} 个，当前为 {len(raw_tune)} 个")
+        )
+
+    id_set = set(data.layer_ids)
+    tune_ids: list[str] = []
+    seen: set[str] = set()
+    for k, item in enumerate(raw_tune):
+        if not isinstance(item, str) or not item.strip():
+            errors.append(_err("tune", f"待调图层 ID 第 {k + 1} 项不是有效字符串"))
+            continue
+        lid = item.strip()
+        if lid not in id_set:
+            errors.append(_err("tune", f"待调图层 ID 不存在：{lid}"))
+            continue
+        if lid in seen:
+            errors.append(_err("tune", f"待调图层 ID 重复：{lid}"))
+            continue
+        seen.add(lid)
+        tune_ids.append(lid)
+
+    if errors:
+        return None, errors
+    tune_ids.sort()  # 统一按 ID 字典序：参数元组决胜与输出均以此为准
+    return tune_ids, errors
+
+
+def infer_opacities(payload: Any) -> dict[str, Any]:
+    """顺序固定时，联合扫描 1～2 个图层的不透明度，按总 SSE 最小反推建议值。"""
+    data = _parse_inputs(payload)
+
+    order_ids, order_errors = _parse_order(payload, data)
+    tune_ids, tune_errors = _parse_tune_ids(payload, data)
+    errors = order_errors + tune_errors
+    if errors:
+        raise CalibrationError(errors)
+
+    assert order_ids is not None and tune_ids is not None
+    order_idx = [data.layer_ids.index(lid) for lid in order_ids]
+    tune_idx = [data.layer_ids.index(lid) for lid in tune_ids]
+
+    # ---- 联合网格（含原始参数组） ------------------------------------------
+    grid = [k / 100.0 for k in range(OPACITY_STEPS)]
+    original_combo = tuple(data.layer_alpha[i] for i in tune_idx)
+    combos = sorted(set(itertools.product(grid, repeat=len(tune_idx))) | {original_combo})
+
+    best_key: tuple[float, tuple[float, ...]] | None = None
+    best_combo: tuple[float, ...] | None = None
+    for combo in combos:
+        alphas = data.layer_alpha.copy()
+        for j, layer_idx in enumerate(tune_idx):
+            alphas[layer_idx] = combo[j]
+        total_sse, _ = _evaluate(data, order_idx, alphas)
+        key = (total_sse, combo)  # 同分：按 ID 字典序参数元组从小到大
+        if best_key is None or key < best_key:
+            best_key = key
+            best_combo = combo
+
+    assert best_key is not None and best_combo is not None
+    suggested_alphas = data.layer_alpha.copy()
+    for j, layer_idx in enumerate(tune_idx):
+        suggested_alphas[layer_idx] = best_combo[j]
+    before_sse, before_details = _evaluate(data, order_idx, data.layer_alpha)
+    after_sse, after_details = _evaluate(data, order_idx, suggested_alphas)
+
+    sample_results: list[dict[str, Any]] = []
+    for s in range(len(data.samples_bg_srgb)):
+        sample_results.append(
+            {
+                "index": s,
+                "background": data.samples_bg_hex[s],
+                "target": data.samples_tg_hex[s],
+                "before": {k: before_details[s][k] for k in ("predictedRgb", "predictedHex", "targetRgb", "channelSse", "sse")},
+                "after": {k: after_details[s][k] for k in ("predictedRgb", "predictedHex", "targetRgb", "channelSse", "sse")},
+            }
+        )
+
+    return {
+        "order": order_ids,
+        "orderIndexes": order_idx,
+        "tune": [
+            {
+                "id": tune_ids[j],
+                "originalOpacity": original_combo[j],
+                "suggestedOpacity": best_combo[j],
+            }
+            for j in range(len(tune_idx))
+        ],
+        "beforeTotalSse": before_sse,
+        "afterTotalSse": after_sse,
+        "combinationsChecked": len(combos),
         "samples": sample_results,
     }
