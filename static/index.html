@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>透明图层叠序校准台</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>透明图层叠序校准台</h1>
+    <p class="subtitle">
+      录入 2～7 个纯色透明图层与 1～4 组「背景色 / 目标色」样本，
+      在线性光空间中枚举所有底→顶叠放顺序，按未取整 RGB 平方误差总和选最优。
+    </p>
+  </header>
+
+  <main class="layout">
+    <!-- ================= 左栏：输入 ================= -->
+    <section class="col-input">
+      <div id="errorBanner" class="error-banner" hidden>
+        <div class="error-title">输入有误，已暂停计算：</div>
+        <ul id="errorList"></ul>
+      </div>
+
+      <!-- 图层 -->
+      <div class="card">
+        <div class="card-head">
+          <h2>图层 <span class="hint">（2～7 个，ID 唯一）</span></h2>
+          <button id="addLayerBtn" class="btn btn-small" data-act="add-layer" type="button">＋ 添加图层</button>
+        </div>
+        <div id="layers" class="rows"></div>
+      </div>
+
+      <!-- 样本 -->
+      <div class="card">
+        <div class="card-head">
+          <h2>背景 / 目标样本 <span class="hint">（1～4 组）</span></h2>
+          <button id="addSampleBtn" class="btn btn-small" data-act="add-sample" type="button">＋ 添加样本</button>
+        </div>
+        <div id="samples" class="rows"></div>
+      </div>
+
+      <!-- 先后关系 -->
+      <div class="card">
+        <div class="card-head">
+          <h2>上下先后关系 <span class="hint">（0～12 条，成环会冲突）</span></h2>
+          <button id="addRelationBtn" class="btn btn-small" data-act="add-relation" type="button">＋ 添加关系</button>
+        </div>
+        <div id="relations" class="rows"></div>
+      </div>
+    </section>
+
+    <!-- ================= 右栏：结果 ================= -->
+    <section class="col-result">
+      <div class="card result-card">
+        <div class="card-head">
+          <h2>校准结果</h2>
+          <span id="status" class="status"></span>
+        </div>
+
+        <div id="resultBody" class="result-body">
+          <div class="result-empty">等待输入…</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

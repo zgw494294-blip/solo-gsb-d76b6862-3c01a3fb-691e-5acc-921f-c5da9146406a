@@ -1,0 +1,7 @@
+services:
+  layer-calibrator:
+    build: .
+    container_name: transparent-layer-calibrator
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
