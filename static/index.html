@@ -63,6 +63,30 @@
           <div class="result-empty">等待输入…</div>
         </div>
       </div>
+
+      <!-- 不透明度反推 -->
+      <div class="card infer-card" id="inferCard" hidden>
+        <div class="card-head">
+          <h2>不透明度反推 <span class="hint">（顺序已定，联合微调 1～2 个图层）</span></h2>
+          <span id="inferStatus" class="status"></span>
+        </div>
+        <div id="inferBody">
+          <div class="infer-field">
+            <div class="infer-field-label">确认底 → 顶顺序（每个图层恰好出现一次，且满足先后关系）</div>
+            <div id="inferOrder" class="infer-order"></div>
+          </div>
+          <div class="infer-field">
+            <div class="infer-field-label">待调图层（勾选 1～2 个，其余图层保留原不透明度）</div>
+            <div id="inferPick" class="infer-pick"></div>
+          </div>
+          <div class="infer-actions">
+            <button id="inferRunBtn" class="btn btn-small" data-act="infer-run" type="button">反推建议不透明度</button>
+            <span id="inferHint" class="hint"></span>
+          </div>
+          <div id="inferErrors" class="infer-errors" hidden></div>
+          <div id="inferResult"></div>
+        </div>
+      </div>
     </section>
   </main>
 

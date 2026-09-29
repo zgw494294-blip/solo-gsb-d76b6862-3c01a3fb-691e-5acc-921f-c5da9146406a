@@ -9,9 +9,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .core import CalibrationError, solve
+from .core import CalibrationError, infer_opacities, solve
 
-app = FastAPI(title="透明图层叠序校准台", version="1.0.0")
+app = FastAPI(title="透明图层叠序校准台", version="1.1.0")
 
 
 @app.get("/api/health")
@@ -30,6 +30,22 @@ async def api_solve(request: Request) -> JSONResponse:
         )
     try:
         result = solve(payload)
+    except CalibrationError as exc:
+        return JSONResponse(status_code=400, content={"errors": exc.errors})
+    return JSONResponse(status_code=200, content=result)
+
+
+@app.post("/api/infer-opacity")
+async def api_infer_opacity(request: Request) -> JSONResponse:
+    try:
+        payload: Any = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"errors": [{"scope": "form", "message": "请求体不是合法的 JSON"}]},
+        )
+    try:
+        result = infer_opacities(payload)
     except CalibrationError as exc:
         return JSONResponse(status_code=400, content={"errors": exc.errors})
     return JSONResponse(status_code=200, content=result)

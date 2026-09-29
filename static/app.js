@@ -52,6 +52,7 @@ function escapeHtml(s) {
 function scheduleSolve(delay = 200) {
   clearTimeout(solveTimer);
   solveTimer = setTimeout(runSolve, delay);
+  markInferStaleness();
 }
 
 // ------------------------------------------------------------ 渲染输入 --
@@ -400,6 +401,7 @@ function showErrors(errors) {
   elStatus.textContent = "存在输入错误";
   elStatus.className = "status";
   elResultBody.innerHTML = `<div class="result-empty">修正输入后将自动重新计算。</div>`;
+  $("#inferCard").hidden = true;
 }
 
 // ------------------------------------------------------------ 结果渲染 --
@@ -441,6 +443,7 @@ function renderResult(r) {
     ${r.samples.map(renderSample).join("")}
   `;
   elResultBody.innerHTML = body;
+  syncInferPanel(r);
 }
 
 function renderSample(s) {
@@ -499,6 +502,336 @@ function fmtSse(v) {
   if (v === 0) return "0";
   if (v < 0.001) return v.toExponential(3);
   return Number(v.toFixed(4)).toString();
+}
+
+// 网格值（0.01 整数倍）显示为两位小数；原始参数组入选时保留必要精度
+function fmtOpacity(v) {
+  if (Math.abs(v - Math.round(v * 100) / 100) < 1e-9) return Number(v.toFixed(2)).toString();
+  return String(v);
+}
+
+// ============================================================ 不透明度反推 ==
+
+const inferState = {
+  order: [],          // 当前确认顺序（ID 数组）
+  picks: new Set(),   // 勾选的待调 ID
+  result: null,       // 最近一次成功返回
+  resultKey: "",      // 结果产生时的输入指纹
+  appliedSig: "",     // 上一次点「应用」之后的输入指纹（与当前一致则结果仍代表现状）
+  applied: false,     // 当前结果是否已写回图层
+};
+
+let orderSlotBefore = "";
+
+const elInferCard = $("#inferCard");
+const elInferOrder = $("#inferOrder");
+const elInferPick = $("#inferPick");
+const elInferHint = $("#inferHint");
+const elInferErrors = $("#inferErrors");
+const elInferResult = $("#inferResult");
+const elInferStatus = $("#inferStatus");
+
+function inferSignature() {
+  // 用于判断已有反推结果是否对应当前输入
+  return JSON.stringify({
+    layers: state.layers,
+    samples: state.samples,
+    relations: state.relations,
+    order: inferState.order,
+    picks: [...inferState.picks].sort(),
+  });
+}
+
+function syncInferPanel(solveResult) {
+  elInferCard.hidden = false;
+  const idSig = state.layers.map((l) => l.id).join("");
+  const layerSet = new Set(state.layers.map((l) => l.id));
+
+  if (inferState._idSig !== idSig) {
+    // 图层集合（ID 列表）变化：重建顺序与勾选，默认采用求解顺序
+    inferState._idSig = idSig;
+    inferState.order = [...solveResult.order];
+    inferState.picks = new Set();
+    inferState.result = null;
+    inferState.resultKey = "";
+    inferState.appliedSig = "";
+    inferState.applied = false;
+    elInferResult.innerHTML = "";
+    elInferErrors.hidden = true;
+  } else {
+    // 集合未变：把求解新出现、但当前顺序未包含的 ID 补齐（防御性）
+    inferState.order = inferState.order.filter((id) => layerSet.has(id));
+    solveResult.order.forEach((id) => {
+      if (!inferState.order.includes(id)) inferState.order.push(id);
+    });
+    inferState.picks = new Set([...inferState.picks].filter((id) => layerSet.has(id)));
+  }
+  renderInferControls();
+  markInferStaleness();
+}
+
+function layerById(id) {
+  return state.layers.find((l) => l.id === id);
+}
+
+function renderInferControls() {
+  // ---- 顺序槽 ----
+  elInferOrder.innerHTML = "";
+  inferState.order.forEach((id, pos) => {
+    const layer = layerById(id);
+    const hex = (layer && normalizeHex(layer.color)) || "#000000";
+    const op = layer && Number.isFinite(layer.opacity) ? layer.opacity : null;
+    const slot = document.createElement("span");
+    slot.className = "order-slot";
+    slot.innerHTML = `
+      <select data-act="infer-order" data-pos="${pos}" title="该位置（底 → 顶第 ${pos + 1} 层）的图层">
+        ${state.layers
+          .map(
+            (l) =>
+              `<option value="${escapeHtml(l.id)}"${l.id === id ? " selected" : ""}>${escapeHtml(
+                l.id
+              )}</option>`
+          )
+          .join("")}
+      </select>
+      <span class="mini-dot" style="background:${hexToRgba(hex, op == null ? 1 : op)}"></span>
+      <span class="mini-op">${op == null ? "α 非法" : "α=" + Number(op.toFixed(2))}</span>
+    `;
+    elInferOrder.appendChild(slot);
+    if (pos < inferState.order.length - 1) {
+      const ar = document.createElement("span");
+      ar.className = "infer-arrow";
+      ar.textContent = "↑";
+      elInferOrder.appendChild(ar);
+    }
+  });
+
+  // ---- 待调勾选 ----
+  elInferPick.innerHTML = "";
+  state.layers.forEach((l) => {
+    const hex = normalizeHex(l.color) || "#000000";
+    const checked = inferState.picks.has(l.id);
+    const disabled = !checked && inferState.picks.size >= 2;
+    const label = document.createElement("label");
+    label.className = "pick-item" + (disabled ? " disabled" : "");
+    label.innerHTML = `
+      <input type="checkbox" data-act="infer-pick" data-id="${escapeHtml(l.id)}"
+             ${checked ? "checked" : ""} ${disabled ? "disabled" : ""} />
+      <span class="pick-dot" style="background:${hexToRgba(hex, l.opacity)}"></span>
+      <span>${escapeHtml(l.id)}</span>
+    `;
+    elInferPick.appendChild(label);
+  });
+
+  updateInferRunHint();
+  markInferStaleness();
+}
+
+function updateInferRunHint() {
+  const btn = $("#inferRunBtn");
+  const n = inferState.picks.size;
+  btn.disabled = n < 1 || n > 2;
+  elInferHint.textContent =
+    n === 0 ? "请勾选 1～2 个待调图层" : `已选 ${n} 个，将在 0.00～1.00（步长 0.01）网格上联合反推`;
+}
+
+function markInferStaleness() {
+  if (!inferState.result) return;
+  const sig = inferSignature();
+  // 结果产生时、或上次应用建议值之后的状态，都视为与当前结果一致
+  const fresh = sig === inferState.resultKey || sig === inferState.appliedSig;
+  inferState.applied = inferState.applied && fresh;
+  const old = elInferResult.querySelector(".stale-note");
+  if (!fresh && !old) {
+    const note = document.createElement("div");
+    note.className = "stale-note";
+    note.textContent = "输入或选择已变化，以下结果可能过期，请重新反推。";
+    elInferResult.prepend(note);
+  } else if (fresh && old) {
+    old.remove();
+  }
+}
+
+// 结果是否仍代表当前输入；false 时「应用」按钮应可重新点击
+function inferResultFresh() {
+  if (!inferState.result) return false;
+  const sig = inferSignature();
+  return sig === inferState.resultKey || sig === inferState.appliedSig;
+}
+
+document.addEventListener("change", (e) => {
+  const t = e.target;
+  const act = t.dataset.act;
+  if (act === "infer-order") {
+    const pos = Number(t.dataset.pos);
+    const prev = orderSlotBefore;
+    // 与原占据新 ID 的槽位交换，保证顺序始终是全部图层的一个排列
+    const other = inferState.order.findIndex((id, p) => p !== pos && id === t.value);
+    inferState.order[pos] = t.value;
+    if (other !== -1 && prev) inferState.order[other] = prev;
+    renderInferControls();
+  } else if (act === "infer-pick") {
+    const id = t.dataset.id;
+    if (t.checked) inferState.picks.add(id);
+    else inferState.picks.delete(id);
+    renderInferControls();
+  }
+});
+
+// select change 前记录原值，供交换使用
+document.addEventListener("focusin", (e) => {
+  if (e.target.dataset && e.target.dataset.act === "infer-order") {
+    const pos = Number(e.target.dataset.pos);
+    orderSlotBefore = inferState.order[pos];
+  }
+});
+
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-act]");
+  if (!btn) return;
+  if (btn.dataset.act === "infer-run") runInfer();
+  if (btn.dataset.act === "infer-apply") applyInferResult();
+});
+
+async function runInfer() {
+  const payload = {
+    layers: state.layers.map((l) => ({ id: l.id, color: l.color, opacity: l.opacity })),
+    samples: state.samples.map((s) => ({ background: s.background, target: s.target })),
+    relations: state.relations.map((r) => ({ lower: r.lower, upper: r.upper })),
+    order: inferState.order,
+    adjustIds: [...inferState.picks].sort(),
+  };
+  elInferStatus.textContent = "反推中…";
+  elInferStatus.className = "status busy";
+  elInferErrors.hidden = true;
+
+  try {
+    const resp = await fetch("/api/infer-opacity", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    elInferStatus.textContent = "";
+    elInferStatus.className = "status";
+    if (!resp.ok) {
+      showInferErrors(data.errors || [{ scope: "form", message: "反推失败" }]);
+      return;
+    }
+    inferState.result = data;
+    inferState.resultKey = inferSignature();
+    inferState.applied = false;
+    renderInferResult(data);
+  } catch (err) {
+    elInferStatus.textContent = "";
+    elInferStatus.className = "status";
+    showInferErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
+  }
+}
+
+function showInferErrors(errors) {
+  elInferErrors.innerHTML =
+    '<ul>' + errors.map((er) => `<li>${escapeHtml(er.message)}</li>`).join("") + "</ul>";
+  elInferErrors.hidden = false;
+}
+
+function renderInferResult(r) {
+  const delta = r.afterTotalSse - r.beforeTotalSse;
+  const deltaCls = delta < -1e-9 ? "sse-delta-down" : delta > 1e-9 ? "sse-delta-up" : "";
+  const deltaTxt =
+    Math.abs(delta) < 1e-9 ? "持平" : `${delta > 0 ? "+" : "−"}${fmtSse(Math.abs(delta))}`;
+
+  const rows = r.adjustments
+    .map((a) => {
+      const changed =
+        Math.abs(a.originalOpacity - a.suggestedOpacity) > 1e-9;
+      return `
+        <tr>
+          <td>${escapeHtml(a.id)}</td>
+          <td class="num">${fmtOpacity(a.originalOpacity)}</td>
+          <td class="op-arrow">→</td>
+          <td class="num ${changed ? "op-new" : "op-same"}">
+            ${fmtOpacity(a.suggestedOpacity)}${changed ? "" : "（原值即最优）"}
+          </td>
+        </tr>`;
+    })
+    .join("");
+
+  const samples = r.afterSamples
+    .map((s, k) => renderInferSample(s, r.beforeSamples[k]))
+    .join("");
+
+  const applied = inferResultFresh() && inferState.applied;
+  elInferResult.innerHTML = `
+    <table class="adj-table">
+      <thead><tr><th>待调图层</th><th>原不透明度</th><th></th><th>建议不透明度</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="sse-compare">
+      <span>调整前总误差：<b>${fmtSse(r.beforeTotalSse)}</b></span>
+      <span class="after">调整后总误差：<b>${fmtSse(r.afterTotalSse)}</b></span>
+      <span class="${deltaCls}">变化：<b>${deltaTxt}</b></span>
+      <span>评估组合：<b>${r.combosChecked}</b> 组（含原始参数组）</span>
+    </div>
+    ${samples}
+    <div class="infer-apply-row">
+      <button class="btn btn-small" data-act="infer-apply" type="button"
+              ${applied ? "disabled" : ""}>应用建议值回图层并重新求解</button>
+      ${applied ? '<span class="applied-note">已应用，左侧图层与上方校准结果已更新。</span>' : ""}
+    </div>
+  `;
+}
+
+function renderInferSample(after, before) {
+  return `
+    <div class="sample-result">
+      <div class="sample-result-head">
+        <span>样本 ${after.index + 1}</span>
+        <span class="hint">背景 ${after.background}</span>
+      </div>
+      <div class="tri-compare">
+        ${triCell("目标色", after.target, after.targetRgb, null)}
+        <span class="tri-arrow">→</span>
+        ${triCell("调整前预测", before.predictedHex, before.predictedRgb, before.sse)}
+        <span class="tri-arrow">→</span>
+        ${triCell("调整后预测", after.predictedHex, after.predictedRgb, after.sse)}
+      </div>
+    </div>
+  `;
+}
+
+function triCell(tag, hex, rgb, sse) {
+  const rgbTxt = rgb.map((v) => Math.round(v)).join(", ");
+  return `
+    <div class="tri-cell">
+      <div class="cell-tag">
+        <span>${tag}</span>
+        ${sse == null ? "" : `<span class="tag-sse">SSE ${fmtSse(sse)}</span>`}
+      </div>
+      <div class="tri-swatch">
+        <span class="swatch-big" style="background:${hex}"></span>
+        <span>
+          <div class="hexval">${hex}</div>
+          <div class="name">rgb(${rgbTxt})</div>
+        </span>
+      </div>
+    </div>
+  `;
+}
+
+function applyInferResult() {
+  const r = inferState.result;
+  if (!r) return;
+  r.adjustments.forEach((a) => {
+    const layer = state.layers.find((l) => l.id === a.id);
+    if (layer) layer.opacity = a.suggestedOpacity;
+  });
+  // 记录应用后的状态指纹：在再次改动输入前，结果始终代表当前图层
+  inferState.applied = true;
+  inferState.appliedSig = inferSignature();
+  renderInferResult(inferState.result);
+  render();
+  runSolve();
 }
 
 // ------------------------------------------------------------ 启动 --

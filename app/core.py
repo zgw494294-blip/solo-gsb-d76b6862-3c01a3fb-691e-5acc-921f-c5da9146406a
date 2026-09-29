@@ -4,6 +4,7 @@
 - 线性光空间内逐层 alpha 合成（Porter-Duff "over"）
 - 枚举全部底到顶排列，按未取整 RGB 通道平方误差总和选优
 - 同分时按 ID 序列字典序决胜
+- 图层顺序确定后，可在 0.00～1.00（步长 0.01）网格上联合反推 1～2 个图层的不透明度
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import itertools
 import math
 import re
+from dataclasses import dataclass
 from typing import Any
 
 _HEX_RE = re.compile(r"^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
@@ -20,6 +22,9 @@ MIN_LAYERS = 2
 MAX_SAMPLES = 4
 MIN_SAMPLES = 1
 MAX_RELATIONS = 12
+OPACITY_STEPS = 101  # 0.00～1.00，步长 0.01
+MAX_ADJUST = 2
+MIN_ADJUST = 1
 
 
 class CalibrationError(Exception):
@@ -144,10 +149,25 @@ def _find_cycle(adj: list[list[int]]) -> list[int] | None:
     return None
 
 
-# ------------------------------------------------------------------- 求解 --
+# --------------------------------------------------------- 输入解析（共用） --
 
 
-def solve(payload: Any) -> dict[str, Any]:
+@dataclass
+class _Parsed:
+    ids: list[str]
+    hexes: list[str]
+    lins: list[tuple[float, float, float]]
+    alphas: list[float]
+    seen_ids: dict[str, int]
+    bg_hex: list[str]
+    bg_srgb: list[tuple[float, float, float]]
+    tg_hex: list[str]
+    tg_srgb: list[tuple[float, float, float]]
+    pairs: list[tuple[int, int]]
+
+
+def _parse_inputs(payload: Any) -> tuple[_Parsed, list[dict[str, Any]]]:
+    """解析 layers/samples/relations。结构性致命错误直接抛，字段错误收集后返回。"""
     if not isinstance(payload, dict):
         raise CalibrationError([_err("form", "请求体必须是 JSON 对象")])
 
@@ -268,20 +288,87 @@ def solve(payload: Any) -> dict[str, Any]:
         pair_seen.add(key)
         pairs.append((li, ui))
 
-    if errors:
-        raise CalibrationError(errors)
+    parsed = _Parsed(
+        ids=layer_ids,
+        hexes=layer_hex,
+        lins=layer_lin,
+        alphas=layer_alpha,
+        seen_ids=seen_ids,
+        bg_hex=samples_bg_hex,
+        bg_srgb=samples_bg_srgb,
+        tg_hex=samples_tg_hex,
+        tg_srgb=samples_tg_srgb,
+        pairs=pairs,
+    )
+    return parsed, errors
 
-    # ---- 成环检测 ---------------------------------------------------------
-    n = len(layer_ids)
+
+def _raise_if_cycle(parsed: _Parsed) -> None:
+    n = len(parsed.ids)
     adj: list[list[int]] = [[] for _ in range(n)]
-    for li, ui in pairs:
+    for li, ui in parsed.pairs:
         adj[li].append(ui)
     cycle = _find_cycle(adj)
     if cycle is not None:
-        chain = " → ".join(layer_ids[x] for x in cycle)
+        chain = " → ".join(parsed.ids[x] for x in cycle)
         raise CalibrationError(
             [_err("relations", f"图层先后关系成环，存在冲突：{chain}（底 → 顶方向不能绕回自身）")]
         )
+
+
+def _total_sse(
+    parsed: _Parsed, order: list[int], alphas: list[float]
+) -> float:
+    """给定顺序与不透明度，计算全部样本未取整 RGB 平方误差总和。"""
+    total = 0.0
+    for s in range(len(parsed.bg_hex)):
+        pred = render_stack(parsed.bg_srgb[s], order, parsed.lins, alphas)
+        for c in range(3):
+            diff = pred[c] * 255.0 - parsed.tg_srgb[s][c] * 255.0
+            total += diff * diff
+    return total
+
+
+def _sample_details(
+    parsed: _Parsed, order: list[int], alphas: list[float]
+) -> tuple[list[dict[str, Any]], float]:
+    """组装每个样本的预测色与分通道误差，并返回总 SSE。"""
+    results: list[dict[str, Any]] = []
+    total = 0.0
+    for s in range(len(parsed.bg_hex)):
+        pred = render_stack(parsed.bg_srgb[s], order, parsed.lins, alphas)
+        pred255 = [_clamp01(pred[c]) * 255.0 for c in range(3)]
+        tgt255 = [parsed.tg_srgb[s][c] * 255.0 for c in range(3)]
+        channel_sse = [(pred255[c] - tgt255[c]) ** 2 for c in range(3)]
+        sse = sum(channel_sse)
+        total += sse
+        rounded = [max(0, min(255, int(round(v)))) for v in pred255]
+        results.append(
+            {
+                "index": s,
+                "background": parsed.bg_hex[s],
+                "target": parsed.tg_hex[s],
+                "predictedRgb": pred255,
+                "predictedHex": "#{:02x}{:02x}{:02x}".format(*rounded),
+                "targetRgb": tgt255,
+                "channelSse": channel_sse,
+                "sse": sse,
+            }
+        )
+    return results, total
+
+
+# ------------------------------------------------------------------- 求解 --
+
+
+def solve(payload: Any) -> dict[str, Any]:
+    parsed, errors = _parse_inputs(payload)
+    if errors:
+        raise CalibrationError(errors)
+    _raise_if_cycle(parsed)
+
+    n = len(parsed.ids)
+    pairs = parsed.pairs
 
     # ---- 枚举排列并选优 ---------------------------------------------------
     def feasible(perm: tuple[int, ...]) -> bool:
@@ -300,13 +387,8 @@ def solve(payload: Any) -> dict[str, Any]:
         if not feasible(perm):
             continue
         feasible_count += 1
-        total_sse = 0.0
-        for s in range(len(samples_bg_hex)):
-            pred = render_stack(samples_bg_srgb[s], list(perm), layer_lin, layer_alpha)
-            for c in range(3):
-                diff = pred[c] * 255.0 - samples_tg_srgb[s][c] * 255.0
-                total_sse += diff * diff
-        id_seq = tuple(layer_ids[idx] for idx in perm)
+        total_sse = _total_sse(parsed, list(perm), parsed.alphas)
+        id_seq = tuple(parsed.ids[idx] for idx in perm)
         if best_key is None or (total_sse, id_seq) < best_key:
             best_sse = total_sse
             best_key = (total_sse, id_seq)
@@ -316,40 +398,175 @@ def solve(payload: Any) -> dict[str, Any]:
     if best_perm is None:  # pragma: no cover
         raise CalibrationError([_err("relations", "约束过强，没有任何可行的图层顺序")])
 
-    total_sse = best_sse
     assert best_perm is not None
-
-    # ---- 组装各样本明细 ---------------------------------------------------
-    sample_results: list[dict[str, Any]] = []
-    for s in range(len(samples_bg_hex)):
-        pred = render_stack(samples_bg_srgb[s], list(best_perm), layer_lin, layer_alpha)
-        pred255 = [_clamp01(pred[c]) * 255.0 for c in range(3)]
-        tgt255 = [samples_tg_srgb[s][c] * 255.0 for c in range(3)]
-        channel_sse = [(pred255[c] - tgt255[c]) ** 2 for c in range(3)]
-        sse = sum(channel_sse)
-        rounded = [max(0, min(255, int(round(v)))) for v in pred255]
-        sample_results.append(
-            {
-                "index": s,
-                "background": samples_bg_hex[s],
-                "target": samples_tg_hex[s],
-                "predictedRgb": pred255,
-                "predictedHex": "#{:02x}{:02x}{:02x}".format(*rounded),
-                "targetRgb": tgt255,
-                "channelSse": channel_sse,
-                "sse": sse,
-            }
-        )
+    # 与 infer_opacities 的「调整前」走同一明细汇总，保证两边 totalSse 逐位一致
+    sample_results, total_sse = _sample_details(parsed, list(best_perm), parsed.alphas)
 
     return {
-        "order": [layer_ids[idx] for idx in best_perm],
+        "order": [parsed.ids[idx] for idx in best_perm],
         "orderIndexes": list(best_perm),
         "layers": [
-            {"id": layer_ids[i], "color": layer_hex[i], "opacity": layer_alpha[i]}
+            {"id": parsed.ids[i], "color": parsed.hexes[i], "opacity": parsed.alphas[i]}
             for i in best_perm
         ],
         "totalSse": total_sse,
         "permutationsChecked": total_count,
         "feasibleCount": feasible_count,
         "samples": sample_results,
+    }
+
+
+# --------------------------------------------------------- 不透明度反推 --
+
+
+def infer_opacities(payload: Any) -> dict[str, Any]:
+    """顺序固定、其余图层不透明度保留原值，网格联合反推 1～2 个图层的不透明度。"""
+    parsed, errors = _parse_inputs(payload)
+    n = len(parsed.ids)
+    id_set = {lid for lid in parsed.ids if lid}
+
+    # ---- 底到顶顺序 -------------------------------------------------------
+    raw_order = payload.get("order") if isinstance(payload, dict) else None
+    order_ids: list[str] = []
+    order_valid = True
+    if not isinstance(raw_order, list):
+        errors.append(
+            _err("order", "缺少 order 列表或其格式不正确：必须按底→顶顺序给出全部图层 ID")
+        )
+        order_valid = False
+    else:
+        if len(raw_order) != n:
+            errors.append(
+                _err("order", f"order 必须恰好包含全部 {n} 个图层 ID（各一次），当前 {len(raw_order)} 个")
+            )
+            order_valid = False
+        seen_order: set[str] = set()
+        for x in raw_order:
+            if not isinstance(x, str) or not x.strip():
+                errors.append(_err("order", f"order 中的图层 ID 非法：{x!r}（必须是已存在的图层 ID）"))
+                order_valid = False
+                continue
+            x = x.strip()
+            if x not in id_set:
+                errors.append(_err("order", f"order 中的图层 ID 不存在：{x!r}"))
+                order_valid = False
+            elif x in seen_order:
+                errors.append(
+                    _err("order", f"order 中图层 ID 重复：{x}，每个图层必须且只能出现一次")
+                )
+                order_valid = False
+            else:
+                seen_order.add(x)
+            order_ids.append(x)
+
+    # ---- 待调图层 ---------------------------------------------------------
+    raw_adjust = payload.get("adjustIds") if isinstance(payload, dict) else None
+    adjust_ids: list[str] = []
+    if not isinstance(raw_adjust, list):
+        errors.append(
+            _err("adjust", "缺少 adjustIds 列表或其格式不正确：必须选择 1～2 个待反推图层 ID")
+        )
+    else:
+        if not (MIN_ADJUST <= len(raw_adjust) <= MAX_ADJUST):
+            errors.append(
+                _err("adjust", f"待调图层必须为 {MIN_ADJUST}～{MAX_ADJUST} 个，当前 {len(raw_adjust)} 个")
+            )
+        seen_adjust: set[str] = set()
+        for x in raw_adjust:
+            if not isinstance(x, str) or not x.strip() or x.strip() not in id_set:
+                errors.append(_err("adjust", f"待调图层 ID 不存在：{x!r}"))
+                continue
+            x = x.strip()
+            if x in seen_adjust:
+                errors.append(_err("adjust", f"待调图层 ID 重复：{x}，同一图层只能选择一次"))
+                continue
+            seen_adjust.add(x)
+            adjust_ids.append(x)
+
+    if errors:
+        raise CalibrationError(errors)
+    _raise_if_cycle(parsed)
+
+    order_idx = [parsed.seen_ids[x] for x in order_ids]
+
+    # ---- 顺序必须符合先后关系 ---------------------------------------------
+    pos = [0] * n
+    for p, idx in enumerate(order_idx):
+        pos[idx] = p
+    for li, ui in parsed.pairs:
+        if pos[li] >= pos[ui]:
+            raise CalibrationError(
+                [
+                    _err(
+                        "order",
+                        f"所给顺序不符合先后关系：{parsed.ids[li]} 必须在 {parsed.ids[ui]} 下方（底 → 顶）",
+                    )
+                ]
+            )
+
+    # 待调图层按 ID 字典序排列，元组决胜均以此顺序为准
+    adjust_ids = sorted(adjust_ids)
+    adjust_idx = [parsed.seen_ids[x] for x in adjust_ids]
+    k = len(adjust_idx)
+    original_tuple = tuple(round(parsed.alphas[i], 10) for i in adjust_idx)
+    original_on_grid = all(abs(a - round(a, 2)) <= 1e-9 for a in original_tuple)
+
+    # ---- 联合遍历 0.00～1.00（步长 0.01），并额外纳入原始参数组 -----------
+    best_sse = math.inf
+    best_tuple: tuple[float, ...] | None = None
+
+    def consider(values: tuple[float, ...], total_sse: float) -> None:
+        nonlocal best_sse, best_tuple
+        if best_tuple is None or (total_sse, values) < (best_sse, best_tuple):
+            best_sse = total_sse
+            best_tuple = values
+
+    alphas = parsed.alphas.copy()
+    for steps in itertools.product(range(OPACITY_STEPS), repeat=k):
+        combo = tuple(s / 100.0 for s in steps)
+        for j, ai in enumerate(adjust_idx):
+            alphas[ai] = combo[j]
+        consider(combo, _total_sse(parsed, order_idx, alphas))
+
+    if not original_on_grid:
+        for j, ai in enumerate(adjust_idx):
+            alphas[ai] = original_tuple[j]
+        consider(original_tuple, _total_sse(parsed, order_idx, alphas))
+
+    combos_checked = OPACITY_STEPS**k + (0 if original_on_grid else 1)
+    assert best_tuple is not None
+
+    # ---- 调整前后明细（建议值即最优元组；若原始参数组最优则建议=原值）-------
+    before_samples, before_total = _sample_details(parsed, order_idx, parsed.alphas)
+
+    after_alphas = parsed.alphas.copy()
+    for j, ai in enumerate(adjust_idx):
+        after_alphas[ai] = best_tuple[j]
+    after_samples, after_total = _sample_details(parsed, order_idx, after_alphas)
+
+    adjustments = [
+        {
+            "id": adjust_ids[j],
+            "index": adjust_idx[j],
+            "originalOpacity": parsed.alphas[adjust_idx[j]],
+            "suggestedOpacity": round(best_tuple[j], 10),
+        }
+        for j in range(k)
+    ]
+
+    return {
+        "order": [parsed.ids[i] for i in order_idx],
+        "orderIndexes": order_idx,
+        "adjustIds": adjust_ids,
+        "layers": [
+            {"id": parsed.ids[i], "color": parsed.hexes[i], "opacity": parsed.alphas[i]}
+            for i in order_idx
+        ],
+        "adjustments": adjustments,
+        "beforeTotalSse": before_total,
+        "afterTotalSse": after_total,
+        "beforeSamples": before_samples,
+        "afterSamples": after_samples,
+        "combosChecked": combos_checked,
+        "opacityGrid": {"min": 0.0, "max": 1.0, "step": 0.01},
     }
